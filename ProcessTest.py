@@ -1,39 +1,14 @@
 #!/usr/bin/env python3
-"""
-ProcessTest.py
-RM3100 Magnetometer Noise Floor Calculator
+"""RM3100 magnetometer noise-floor calculator.
 
-This script processes RM3100 magnetometer log files that were already recorded
-on a Raspberry Pi, typically using Dave Witten's rm3100-runMag software:
-
-    https://github.com/wittend/rm3100-runMag
-
-It does not communicate with the RM3100 directly. It only processes existing
-.log files after they have been copied from the Raspberry Pi.
-
-Main workflow:
-    1. Select one or more raw RM3100 log files.
-    2. Choose or create a site folder.
-    3. Enter a test label.
-    4. Choose a segment length.
-    5. Run the processing pipeline.
-
-Outputs are saved inside the repository folder by default:
-
-    SiteName/
-        All/
-            TestLabel_full.log
-        TestLabel/
-            chopped segment files
-        TestLabel Figures/
-            PSD and noise-floor PNG plots
-        TestLabel_noise_summary.csv
+Processes one or more RM3100 log files that have already been copied from the
+Raspberry Pi. The program merges the selected logs, splits them into time
+segments, calculates amplitude spectral density (ASD), and saves plots plus a
+CSV summary for X, Y, Z, and total field.
 """
 
 import csv
-import re
 import shutil
-import threading
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,595 +23,535 @@ import numpy as np
 from scipy.signal import welch
 
 
-# The default output location is the folder containing this script.
-# This keeps the script portable for GitHub users.
 ROOT = Path(__file__).resolve().parent
 
-# Human-readable timestamp format used by rm3100-runMag logs.
-# Epoch timestamps are also accepted.
-TS_FMT_HUMAN = "%d %b %Y %H:%M:%S"
-
-EXPECTED_HEADER = '"time", "rtemp", "ltemp", "x", "y", "z", "rx", "ry", "rz", "total"'
-
-# Frequency band used for the broadband noise-floor estimate.
-# For 1 Hz data, Nyquist is 0.5 Hz, so this avoids both low-frequency drift
-# and the upper edge of the spectrum.
-FLAT_LO = 0.10
-FLAT_HI = 0.40
-
-# Quick reference line for the plots and console PASS/FAIL messages.
-PSWS_TARGET_NT = 10.0
+HEADER = ("time", "rtemp", "ltemp", "x", "y", "z", "rx", "ry", "rz", "total")
+HUMAN_TIME_FORMAT = "%d %b %Y %H:%M:%S"
+SAMPLE_RATE_HZ = 1.0
+NOISE_BAND_HZ = (0.10, 0.40)
+PSWS_REFERENCE_NT = 10.0
+CHANNELS = ("X", "Y", "Z", "TOTAL")
+INVALID_LABEL_CHARS = '<>:"/\\|?*'
 
 
-def _to_epoch(ts: str) -> float:
-    """
-    Convert a timestamp to epoch seconds.
-
-    Accepted inputs:
-        - "28 May 2026 22:00:00"
-        - "1780005600.0"
-    """
-    ts = ts.strip().strip('"')
+def parse_timestamp(value):
+    """Return a human-readable or epoch timestamp as UTC epoch seconds."""
+    value = value.strip().strip('"')
 
     try:
-        return datetime.strptime(ts, TS_FMT_HUMAN).replace(tzinfo=timezone.utc).timestamp()
+        return datetime.strptime(value, HUMAN_TIME_FORMAT).replace(
+            tzinfo=timezone.utc
+        ).timestamp()
     except ValueError:
-        return float(ts)
+        return float(value)
 
 
-def _line_to_epoch(line: str) -> str:
-    """
-    Convert the first column of a log line to epoch time when possible.
-    Header lines and invalid lines are returned unchanged.
-    """
-    s = line.rstrip("\n")
-
-    if not s or s.strip() == EXPECTED_HEADER:
-        return s + "\n"
-
-    match = re.match(r'^"([^"]+)"\s*,\s*(.*)$', s)
-
-    if match:
-        try:
-            return str(_to_epoch(match.group(1))) + ", " + match.group(2) + "\n"
-        except ValueError:
-            pass
-
-    return line
-
-
-def chop_files(raw_paths, out_dir, segment_minutes, full_archive_path=None):
-    """
-    Merge selected raw logs, sort them by time, save one full archive,
-    and split the data into fixed-length segment files.
-
-    Returns:
-        Number of segment files written.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    segment_seconds = segment_minutes * 60
-    header_line = EXPECTED_HEADER + "\n"
+def read_log_rows(paths):
+    """Read valid data rows from one or more RM3100 log files."""
     rows = []
 
-    for path in sorted(raw_paths):
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                converted = _line_to_epoch(line)
-                stripped = converted.strip()
+    for path in sorted(paths):
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as file:
+            reader = csv.reader(file, skipinitialspace=True)
 
-                if not stripped:
+            for record in reader:
+                if len(record) < len(HEADER):
                     continue
 
-                if stripped == EXPECTED_HEADER:
-                    header_line = converted
+                if record[0].strip().lower() == "time":
                     continue
 
                 try:
-                    epoch = float(stripped.split(",", 1)[0].strip())
-                    rows.append((epoch, converted))
+                    epoch = parse_timestamp(record[0])
+                    values = [field.strip() for field in record[1:len(HEADER)]]
                 except ValueError:
                     continue
 
+                rows.append((epoch, [f"{epoch:.6f}", *values]))
+
     if not rows:
-        raise ValueError("No valid data rows found in the selected file(s).")
+        raise ValueError("No valid data rows were found in the selected file(s).")
 
-    rows.sort(key=lambda r: r[0])
+    rows.sort(key=lambda item: item[0])
+    return rows
 
-    # Save one complete merged file before chopping.
-    if full_archive_path is not None:
-        full_archive_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with full_archive_path.open("w", encoding="utf-8") as archive:
-            archive.write(header_line)
-            for _, line in rows:
-                archive.write(line)
+def write_log(path, rows):
+    """Write RM3100 rows using the standard ten-column format."""
+    path.parent.mkdir(parents=True, exist_ok=True)
 
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(HEADER)
+        writer.writerows(record for _, record in rows)
+
+
+def split_logs(raw_paths, segment_dir, segment_minutes, archive_path):
+    """Merge, sort, archive, and split selected logs into fixed time segments."""
+    rows = read_log_rows(raw_paths)
+    write_log(archive_path, rows)
+
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    segment_seconds = segment_minutes * 60
     segment_start = rows[0][0]
-    current_fp = None
+    segment_rows = []
     segment_count = 0
 
-    def open_segment(ts):
-        nonlocal current_fp, segment_count
+    def save_segment(records):
+        nonlocal segment_count
 
-        if current_fp:
-            current_fp.close()
+        if not records:
+            return
 
-        filename = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d_%H-%M-%S") + ".log"
-        current_fp = (out_dir / filename).open("w", encoding="utf-8")
-        current_fp.write(header_line)
+        first_timestamp = records[0][0]
+        filename = datetime.fromtimestamp(
+            first_timestamp, tz=timezone.utc
+        ).strftime("%Y-%m-%d_%H-%M-%S.log")
+        write_log(segment_dir / filename, records)
         segment_count += 1
 
-    open_segment(segment_start)
-
-    for epoch, line in rows:
-        if epoch - segment_start >= segment_seconds:
+    for epoch, record in rows:
+        if segment_rows and epoch - segment_start >= segment_seconds:
+            save_segment(segment_rows)
+            segment_rows = []
             segment_start = epoch
-            open_segment(epoch)
 
-        current_fp.write(line)
+        segment_rows.append((epoch, record))
 
-    if current_fp:
-        current_fp.close()
-
+    save_segment(segment_rows)
     return segment_count
 
 
-def _load_segment(path):
-    """
-    Load one chopped segment file.
+def load_segment(path):
+    """Load X, Y, Z, and total field from one segment as nanotesla arrays."""
+    values = [[], [], [], []]
+    column_indices = (3, 4, 5, 9)
 
-    Expected columns:
-        time, rtemp, ltemp, x, y, z, rx, ry, rz, total
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as file:
+        reader = csv.reader(file, skipinitialspace=True)
 
-    Returns:
-        fs, x, y, z, total
-
-    The nominal sample rate is fixed at 1 Hz so all segments use the same
-    frequency grid. Each channel is mean-subtracted before PSD analysis.
-    """
-    x_values, y_values, z_values, total_values = [], [], [], []
-
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        first = f.readline()
-
-        if not first.strip().lower().startswith('"time"'):
-            f.seek(0)
-
-        for line in f:
-            parts = line.strip().split(",")
-
-            if len(parts) < 10:
+        for record in reader:
+            if len(record) < len(HEADER) or record[0].strip().lower() == "time":
                 continue
 
             try:
-                x_values.append(float(parts[3]))
-                y_values.append(float(parts[4]))
-                z_values.append(float(parts[5]))
-                total_values.append(float(parts[9]))
+                for output, column in zip(values, column_indices):
+                    output.append(float(record[column]))
             except ValueError:
                 continue
 
-    if len(x_values) < 2:
-        raise ValueError("Not enough data in " + path.name)
+    if len(values[0]) < 2:
+        raise ValueError(f"Not enough valid data in {path.name}")
 
-    fs = 1.0
+    signals = np.asarray(values, dtype=float)
+    signals -= signals.mean(axis=1, keepdims=True)
+    signals *= 1000.0
+    return signals
 
-    def prep(signal):
-        return (np.array(signal) - np.mean(signal)) * 1e3
 
-    return (
-        fs,
-        prep(x_values),
-        prep(y_values),
-        prep(z_values),
-        prep(total_values),
+def save_overlay_plot(curves, channel, label, output_path):
+    """Save an ASD overlay containing every valid segment for one channel."""
+    figure, axis = plt.subplots(figsize=(10, 5))
+
+    for frequencies, asd in curves:
+        axis.semilogy(frequencies, asd, lw=0.6, alpha=0.65, color="#1f77b4")
+
+    axis.set_xlim(0, 0.5)
+    axis.set_ylim(1e0, 1e3)
+    axis.set_xlabel("Frequency (Hz)")
+    axis.set_ylabel("ASD (nT/√Hz)")
+    axis.set_title(f"{channel} PSD Overlay -- {label}")
+    axis.grid(True, which="both", linestyle="--", alpha=0.4)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
+
+
+def save_noise_floor_plot(
+    frequencies,
+    median_curve,
+    lower_curve,
+    upper_curve,
+    noise_floor,
+    channel,
+    label,
+    output_path,
+):
+    """Save the median ASD, spread, calculated floor, and reference level."""
+    plot_mask = frequencies >= NOISE_BAND_HZ[0]
+    plot_frequencies = frequencies[plot_mask]
+
+    figure, axis = plt.subplots(figsize=(10, 5))
+
+    axis.fill_between(
+        plot_frequencies,
+        lower_curve[plot_mask],
+        upper_curve[plot_mask],
+        alpha=0.25,
+        color="#1f77b4",
+        label="10th-90th percentile",
+    )
+    axis.semilogy(
+        plot_frequencies,
+        median_curve[plot_mask],
+        lw=1.8,
+        color="#1f77b4",
+        label="Median ASD",
+    )
+    axis.axhline(
+        noise_floor,
+        color="green",
+        lw=1.5,
+        linestyle="--",
+        label=f"Noise floor: {noise_floor:.3f} nT/√Hz",
+    )
+    axis.axhline(
+        PSWS_REFERENCE_NT,
+        color="red",
+        lw=1.2,
+        linestyle=":",
+        label=f"Reference: {PSWS_REFERENCE_NT:g} nT/√Hz",
     )
 
+    axis.set_xlim(NOISE_BAND_HZ[0], 0.5)
+    axis.set_ylim(1e0, 1e3)
+    axis.set_xlabel("Frequency (Hz)")
+    axis.set_ylabel("ASD (nT/√Hz)")
+    axis.set_title(f"{channel} Noise Floor -- {label}  [{noise_floor:.3f} nT/√Hz]")
+    axis.legend(fontsize=9, loc="upper right")
+    axis.grid(True, which="both", linestyle="--", alpha=0.4)
 
-def run_psd_and_save(seg_dir, fig_dir, label, summary_path, status_cb):
-    """
-    Run PSD and noise-floor analysis for one test folder.
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
 
-    Saves:
-        - PSD overlay plots
-        - noise-floor plots
-        - CSV summary of noise-floor values
-    """
-    fig_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(seg_dir.glob("*.log"))
+def analyze_segments(segment_dir, figure_dir, label, summary_path, status_callback):
+    """Calculate ASD and noise-floor results for all segments in one test."""
+    files = sorted(segment_dir.glob("*.log"))
     if not files:
-        raise ValueError("No .log files found in " + str(seg_dir))
+        raise ValueError(f"No .log files found in {segment_dir}")
 
-    channels = ("X", "Y", "Z", "TOTAL")
-    segment_curves = {channel: [] for channel in channels}
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    segment_curves = {channel: [] for channel in CHANNELS}
+    valid_segments = 0
 
-    status_cb("Computing PSD on " + str(len(files)) + " segments...")
+    status_callback(f"Computing PSD for {len(files)} segments...")
 
-    for segment_path in files:
+    for path in files:
         try:
-            fs, x, y, z, total = _load_segment(segment_path)
+            signals = load_segment(path)
         except ValueError:
             continue
 
-        channel_data = {
-            "X": x,
-            "Y": y,
-            "Z": z,
-            "TOTAL": total,
-        }
+        n_samples = signals.shape[1]
+        nperseg = min(1024, 2 ** int(np.floor(np.log2(n_samples))))
+        frequencies, psd = welch(
+            signals,
+            fs=SAMPLE_RATE_HZ,
+            nperseg=nperseg,
+            window="hann",
+            axis=1,
+        )
+        asd = np.sqrt(psd)
 
-        for channel, signal in channel_data.items():
-            if len(signal) < 2:
-                continue
+        for index, channel in enumerate(CHANNELS):
+            segment_curves[channel].append((frequencies, asd[index]))
 
-            nperseg = min(1024, 2 ** int(np.floor(np.log2(len(signal)))))
-            freqs, psd = welch(signal, fs=fs, nperseg=nperseg, window="hann")
-            asd = np.sqrt(psd)
+        valid_segments += 1
 
-            segment_curves[channel].append((freqs, asd))
+    if valid_segments == 0:
+        raise ValueError("None of the generated segments contained enough valid data.")
 
-    # Plot every segment curve together for each channel.
-    for channel in channels:
-        curves = segment_curves[channel]
-
-        if not curves:
-            continue
-
-        fig, ax = plt.subplots(figsize=(10, 5))
-
-        for freqs, asd in curves:
-            ax.semilogy(freqs, asd, lw=0.6, alpha=0.65, color="#1f77b4")
-
-        ax.set_xlim(0, 0.5)
-        ax.set_ylim(1e0, 1e3)
-        ax.set_xlabel("Frequency (Hz)", fontsize=11)
-        ax.set_ylabel("ASD (nT/rtHz)", fontsize=11)
-        ax.set_title(channel + " PSD Overlay -- " + label, fontsize=12)
-        ax.grid(True, which="both", linestyle="--", alpha=0.4)
-
-        fig.tight_layout()
-
-        output_path = fig_dir / (channel + "_" + label + ".png")
-        fig.savefig(output_path, dpi=150)
-        plt.close(fig)
-
-        status_cb("Saved " + output_path.name)
-
-    sep = "=" * 60
-    print("")
-    print(sep)
-    print("  NOISE FLOOR RESULTS -- " + label)
-    print("  Flat band: " + str(FLAT_LO) + " - " + str(FLAT_HI) + " Hz")
-    print("  PSWS target/reference: " + str(PSWS_TARGET_NT) + " nT/rtHz")
-    print(sep)
+    for channel in CHANNELS:
+        output_path = figure_dir / f"{channel}_{label}.png"
+        save_overlay_plot(segment_curves[channel], channel, label, output_path)
+        status_callback(f"Saved {output_path.name}")
 
     summary_rows = []
+    low_frequency, high_frequency = NOISE_BAND_HZ
 
-    for channel in channels:
+    print("\n" + "=" * 60)
+    print(f"NOISE FLOOR RESULTS -- {label}")
+    print(f"Noise band: {low_frequency:.2f}-{high_frequency:.2f} Hz")
+    print(f"Reference: {PSWS_REFERENCE_NT:g} nT/√Hz")
+    print("=" * 60)
+
+    for channel in CHANNELS:
         curves = segment_curves[channel]
-
-        if not curves:
-            continue
-
-        common_freqs = curves[0][0]
-        asd_matrix = np.zeros((len(curves), len(common_freqs)))
-
-        for i, (freqs, asd) in enumerate(curves):
-            asd_matrix[i, :] = np.interp(common_freqs, freqs, asd)
+        common_frequencies = curves[0][0]
+        asd_matrix = np.vstack(
+            [np.interp(common_frequencies, frequencies, asd) for frequencies, asd in curves]
+        )
 
         median_curve = np.median(asd_matrix, axis=0)
-        p10_curve = np.percentile(asd_matrix, 10, axis=0)
-        p90_curve = np.percentile(asd_matrix, 90, axis=0)
+        lower_curve = np.percentile(asd_matrix, 10, axis=0)
+        upper_curve = np.percentile(asd_matrix, 90, axis=0)
 
-        flat_mask = (common_freqs >= FLAT_LO) & (common_freqs <= FLAT_HI)
-        noise_floor = float(np.median(median_curve[flat_mask])) if flat_mask.any() else float("nan")
+        band_mask = (
+            (common_frequencies >= low_frequency)
+            & (common_frequencies <= high_frequency)
+        )
+        if not np.any(band_mask):
+            raise ValueError(
+                f"The {channel} data does not contain frequencies in the selected noise band."
+            )
 
-        if noise_floor <= PSWS_TARGET_NT:
-            status = "PASS"
-            quality = "PASS (below " + str(PSWS_TARGET_NT) + " nT/rtHz target)"
-        else:
-            status = "FAIL"
-            ratio = noise_floor / PSWS_TARGET_NT
-            quality = "FAIL (" + "{:.1f}".format(ratio) + "x above target)"
+        noise_floor = float(np.median(median_curve[band_mask]))
+        passed = noise_floor <= PSWS_REFERENCE_NT
+        status = "PASS" if passed else "FAIL"
 
-        print(
-            "  "
-            + channel.ljust(6)
-            + "  floor = "
-            + "{:.3f}".format(noise_floor)
-            + " nT/rtHz"
-            + "  ["
-            + quality
-            + "]"
+        print(f"{channel:<6} floor = {noise_floor:.3f} nT/√Hz  [{status}]")
+
+        summary_rows.append(
+            {
+                "channel": channel,
+                "noise_floor_nT_per_rtHz": f"{noise_floor:.6f}",
+                "flat_band_low_Hz": low_frequency,
+                "flat_band_high_Hz": high_frequency,
+                "target_nT_per_rtHz": PSWS_REFERENCE_NT,
+                "status": status,
+                "segments_used": len(curves),
+            }
         )
 
-        summary_rows.append({
-            "channel": channel,
-            "noise_floor_nT_per_rtHz": "{:.6f}".format(noise_floor),
-            "flat_band_low_Hz": FLAT_LO,
-            "flat_band_high_Hz": FLAT_HI,
-            "target_nT_per_rtHz": PSWS_TARGET_NT,
-            "status": status,
-            "segments_used": len(files),
-        })
-
-        plot_mask = (common_freqs >= FLAT_LO) & (common_freqs <= 0.5)
-        plot_freqs = common_freqs[plot_mask]
-        plot_median = median_curve[plot_mask]
-        plot_p10 = p10_curve[plot_mask]
-        plot_p90 = p90_curve[plot_mask]
-
-        fig, ax = plt.subplots(figsize=(10, 5))
-
-        ax.fill_between(
-            plot_freqs,
-            plot_p10,
-            plot_p90,
-            alpha=0.25,
-            color="#1f77b4",
-            label="10th-90th percentile",
-        )
-
-        ax.semilogy(
-            plot_freqs,
-            plot_median,
-            lw=1.8,
-            color="#1f77b4",
-            label="Median ASD",
-        )
-
-        ax.axhline(
+        output_path = figure_dir / f"{channel}_{label}_noisefloor.png"
+        save_noise_floor_plot(
+            common_frequencies,
+            median_curve,
+            lower_curve,
+            upper_curve,
             noise_floor,
-            color="green",
-            lw=1.5,
-            linestyle="--",
-            label="Noise floor: " + "{:.3f}".format(noise_floor) + " nT/rtHz",
+            channel,
+            label,
+            output_path,
         )
-
-        ax.axhline(
-            PSWS_TARGET_NT,
-            color="red",
-            lw=1.2,
-            linestyle=":",
-            label="Target: " + str(PSWS_TARGET_NT) + " nT/rtHz",
-        )
-
-        ax.set_xlim(FLAT_LO, 0.5)
-        ax.set_ylim(1e0, 1e3)
-        ax.set_xlabel("Frequency (Hz)", fontsize=11)
-        ax.set_ylabel("ASD (nT/rtHz)", fontsize=11)
-        ax.set_title(
-            channel
-            + " Noise Floor -- "
-            + label
-            + "  ["
-            + "{:.3f}".format(noise_floor)
-            + " nT/rtHz]",
-            fontsize=12,
-        )
-        ax.legend(fontsize=9, loc="upper right")
-        ax.grid(True, which="both", linestyle="--", alpha=0.4)
-
-        fig.tight_layout()
-
-        output_path = fig_dir / (channel + "_" + label + "_noisefloor.png")
-        fig.savefig(output_path, dpi=150)
-        plt.close(fig)
-
-        status_cb("Saved " + output_path.name)
+        status_callback(f"Saved {output_path.name}")
 
     summary_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(summary_rows[0])
 
-    with summary_path.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "channel",
-            "noise_floor_nT_per_rtHz",
-            "flat_band_low_Hz",
-            "flat_band_high_Hz",
-            "target_nT_per_rtHz",
-            "status",
-            "segments_used",
-        ]
-
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with summary_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
 
-    status_cb("Saved " + summary_path.name)
-
-    print("  Segments used: " + str(len(files)))
-    print("  Summary CSV: " + str(summary_path))
-    print(sep)
-    print("")
+    status_callback(f"Saved {summary_path.name}")
+    print(f"Segments used: {valid_segments}")
+    print(f"Summary CSV: {summary_path}")
+    print("=" * 60 + "\n")
 
 
 class ProcessTestUI(tk.Tk):
-    """
-    Small file-picker interface for running the pipeline.
-    """
+    """Small desktop interface for the RM3100 processing workflow."""
 
     def __init__(self):
         super().__init__()
 
-        self.title("ProcessTest -- RM3100 Noise Floor Calculator")
+        self.title("RM3100 Noise Floor Calculator")
         self.geometry("660x420")
         self.resizable(False, False)
 
-        self._raw_files = []
+        self.raw_files = []
+        self.site_var = tk.StringVar()
+        self.label_var = tk.StringVar()
+        self.segment_var = tk.IntVar(value=5)
 
-        self._build_ui()
+        self.build_ui()
 
-    def _build_ui(self):
-        pad = {"padx": 10, "pady": 4}
-
+    def build_ui(self):
         raw_frame = ttk.LabelFrame(self, text="1. Raw log file(s)", padding=6)
-        raw_frame.pack(fill=tk.X, **pad)
+        raw_frame.pack(fill=tk.X, padx=10, pady=4)
 
-        self._file_label = ttk.Label(raw_frame, text="No files selected", foreground="gray")
-        self._file_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        ttk.Button(raw_frame, text="Browse...", command=self._pick_files).pack(side=tk.RIGHT)
+        self.file_label = ttk.Label(raw_frame, text="No files selected", foreground="gray")
+        self.file_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(raw_frame, text="Browse...", command=self.pick_files).pack(side=tk.RIGHT)
 
         site_frame = ttk.LabelFrame(
             self,
-            text="2. Site folder  (inside this repository folder)",
+            text="2. Site folder (inside this repository folder)",
             padding=6,
         )
-        site_frame.pack(fill=tk.X, **pad)
+        site_frame.pack(fill=tk.X, padx=10, pady=4)
 
-        self._site_var = tk.StringVar()
-        ttk.Entry(site_frame, textvariable=self._site_var, width=30).pack(
+        ttk.Entry(site_frame, textvariable=self.site_var, width=30).pack(
             side=tk.LEFT,
             fill=tk.X,
             expand=True,
         )
-
-        ttk.Button(site_frame, text="Browse...", command=self._pick_site).pack(side=tk.RIGHT)
-        ttk.Label(site_frame, text="  (type new name to create)", foreground="gray").pack(side=tk.RIGHT)
+        ttk.Button(site_frame, text="Browse...", command=self.pick_site).pack(side=tk.RIGHT)
+        ttk.Label(site_frame, text="  (type a new name to create)", foreground="gray").pack(
+            side=tk.RIGHT
+        )
 
         label_frame = ttk.LabelFrame(
             self,
-            text="3. Test label  (e.g. Test_1, garage_close)",
+            text="3. Test label (e.g. Test_1, garage_close)",
             padding=6,
         )
-        label_frame.pack(fill=tk.X, **pad)
+        label_frame.pack(fill=tk.X, padx=10, pady=4)
 
-        self._label_var = tk.StringVar()
-        ttk.Entry(label_frame, textvariable=self._label_var, width=30).pack(fill=tk.X)
+        ttk.Entry(label_frame, textvariable=self.label_var, width=30).pack(fill=tk.X)
 
         segment_frame = ttk.LabelFrame(self, text="4. Segment length (minutes)", padding=6)
-        segment_frame.pack(fill=tk.X, **pad)
+        segment_frame.pack(fill=tk.X, padx=10, pady=4)
 
-        self._seg_var = tk.IntVar(value=5)
-        ttk.Spinbox(segment_frame, from_=1, to=120, textvariable=self._seg_var, width=8).pack(anchor=tk.W)
+        ttk.Spinbox(
+            segment_frame,
+            from_=1,
+            to=120,
+            textvariable=self.segment_var,
+            width=8,
+        ).pack(anchor=tk.W)
 
-        ttk.Button(self, text="Run", command=self._start).pack(pady=12)
+        self.run_button = ttk.Button(self, text="Run", command=self.start_processing)
+        self.run_button.pack(pady=12)
 
-        self._status = ttk.Label(self, text="Ready.", anchor=tk.W, foreground="gray")
-        self._status.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self.status_label = ttk.Label(self, text="Ready.", anchor=tk.W, foreground="gray")
+        self.status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
 
-    def _pick_files(self):
+    def pick_files(self):
         paths = filedialog.askopenfilenames(
             title="Select raw log file(s)",
             filetypes=[("Log files", "*.log"), ("All files", "*.*")],
         )
 
         if paths:
-            self._raw_files = [Path(p) for p in paths]
-            self._file_label.config(
-                text=", ".join(p.name for p in self._raw_files),
+            self.raw_files = [Path(path) for path in paths]
+            self.file_label.config(
+                text=", ".join(path.name for path in self.raw_files),
                 foreground="black",
             )
 
-    def _pick_site(self):
+    def pick_site(self):
         folder = filedialog.askdirectory(
             title="Select or create site folder",
-            initialdir=str(ROOT) if ROOT.exists() else str(Path.home()),
+            initialdir=ROOT,
         )
 
-        if folder:
-            selected = Path(folder)
-
-            try:
-                self._site_var.set(str(selected.relative_to(ROOT)))
-            except ValueError:
-                self._site_var.set(str(selected))
-
-    def _start(self):
-        if not self._raw_files:
-            messagebox.showwarning("Missing input", "Please select at least one raw log file.")
+        if not folder:
             return
 
-        if not self._site_var.get().strip():
-            messagebox.showwarning("Missing site", "Please enter or select a site folder name.")
-            return
-
-        if not self._label_var.get().strip():
-            messagebox.showwarning("Missing label", "Please enter a test label.")
-            return
-
-        threading.Thread(
-            target=self._run,
-            args=(self._site_var.get().strip(), self._label_var.get().strip()),
-            daemon=True,
-        ).start()
-
-    def _set_status(self, msg):
-        self._status.config(text=msg, foreground="black")
-        print(msg)
-
-    def _run(self, site, label):
+        selected = Path(folder)
         try:
-            site_path = Path(site) if Path(site).is_absolute() else ROOT / site
+            self.site_var.set(str(selected.relative_to(ROOT)))
+        except ValueError:
+            self.site_var.set(str(selected))
 
-            segment_dir = site_path / label
-            figure_dir = site_path / (label + " Figures")
-            archive_path = site_path / "All" / (label + "_full.log")
-            summary_path = site_path / (label + "_noise_summary.csv")
+    def validate_inputs(self):
+        if not self.raw_files:
+            messagebox.showwarning("Missing input", "Select at least one raw log file.")
+            return None
 
-            if segment_dir.exists() and any(segment_dir.iterdir()):
-                if not messagebox.askyesno(
-                    "Folder exists",
-                    segment_dir.name + " already contains files.\n\nOverwrite?",
-                ):
-                    self._set_status("Cancelled.")
-                    return
+        site = self.site_var.get().strip()
+        if not site:
+            messagebox.showwarning("Missing site", "Enter or select a site folder.")
+            return None
 
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showwarning("Missing label", "Enter a test label.")
+            return None
+
+        if label in {".", ".."} or any(char in label for char in INVALID_LABEL_CHARS):
+            messagebox.showwarning(
+                "Invalid label",
+                "The test label contains characters that cannot be used in a folder name.",
+            )
+            return None
+
+        try:
+            segment_minutes = self.segment_var.get()
+        except tk.TclError:
+            messagebox.showwarning("Invalid segment", "Enter a whole number of minutes.")
+            return None
+
+        if not 1 <= segment_minutes <= 120:
+            messagebox.showwarning("Invalid segment", "Segment length must be 1 to 120 minutes.")
+            return None
+
+        return site, label, segment_minutes
+
+    def start_processing(self):
+        inputs = self.validate_inputs()
+        if inputs is None:
+            return
+
+        site, label, segment_minutes = inputs
+        site_path = Path(site) if Path(site).is_absolute() else ROOT / site
+        segment_dir = site_path / label
+        figure_dir = site_path / f"{label} Figures"
+
+        existing_output = (
+            (segment_dir.exists() and any(segment_dir.iterdir()))
+            or (figure_dir.exists() and any(figure_dir.iterdir()))
+        )
+
+        if existing_output and not messagebox.askyesno(
+            "Replace existing output",
+            f"Output for '{label}' already exists. Replace it?",
+        ):
+            return
+
+        raw_files = tuple(self.raw_files)
+        self.run_button.config(state=tk.DISABLED)
+        self.set_status("Starting...")
+
+        try:
+            self.process(raw_files, site_path, label, segment_minutes)
+        finally:
+            self.run_button.config(state=tk.NORMAL)
+
+    def process(self, raw_files, site_path, label, segment_minutes):
+        segment_dir = site_path / label
+        figure_dir = site_path / f"{label} Figures"
+        archive_path = site_path / "All" / f"{label}_full.log"
+        summary_path = site_path / f"{label}_noise_summary.csv"
+
+        try:
+            if segment_dir.exists():
                 shutil.rmtree(segment_dir)
+            if figure_dir.exists():
+                shutil.rmtree(figure_dir)
 
-            if figure_dir.exists() and any(figure_dir.iterdir()):
-                if messagebox.askyesno(
-                    "Figure folder exists",
-                    figure_dir.name + " already contains files.\n\nOverwrite figures?",
-                ):
-                    shutil.rmtree(figure_dir)
-                else:
-                    self._set_status("Cancelled.")
-                    return
-
-            self._set_status("Chopping segments...")
-
-            segment_count = chop_files(
-                self._raw_files,
+            self.set_status("Splitting log into segments...")
+            segment_count = split_logs(
+                raw_files,
                 segment_dir,
-                self._seg_var.get(),
-                full_archive_path=archive_path,
+                segment_minutes,
+                archive_path,
             )
 
-            self._set_status("Chopped into " + str(segment_count) + " segments. Running PSD...")
-
-            run_psd_and_save(
+            self.set_status(f"Created {segment_count} segments. Running PSD analysis...")
+            analyze_segments(
                 segment_dir,
                 figure_dir,
                 label,
                 summary_path,
-                self._set_status,
+                self.set_status,
             )
 
-            self._set_status(
-                "Done.  "
-                + str(segment_count)
-                + " segments  |  Figures -> "
-                + str(figure_dir)
-                + "  |  Archive -> "
-                + str(archive_path)
-                + "  |  Summary -> "
-                + str(summary_path)
+            message = (
+                f"Done. {segment_count} segments | "
+                f"Figures: {figure_dir} | Summary: {summary_path}"
             )
+            self.set_status(message)
 
-        except Exception as e:
-            import traceback
+        except Exception as error:
+            error_message = str(error)
+            print(f"Error: {error_message}")
+            messagebox.showerror("Error", error_message)
+            self.set_status(f"Error: {error_message}")
 
-            traceback.print_exc()
-            messagebox.showerror("Error", str(e))
-            self._set_status("Error: " + str(e))
+    def set_status(self, message):
+        print(message)
+        self.status_label.config(text=message, foreground="black")
+        self.update_idletasks()
 
 
 def main():
-    app = ProcessTestUI()
-    app.mainloop()
+    ProcessTestUI().mainloop()
 
 
 if __name__ == "__main__":
