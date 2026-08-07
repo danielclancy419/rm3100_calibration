@@ -1,138 +1,174 @@
 # RM3100 Noise Floor Calculator
 
-This repository contains a Python tool for processing RM3100 magnetometer log files recorded on a Raspberry Pi using Dave Witten's `rm3100-runMag` software.
+This repository contains a Python tool for analyzing data recorded by a PNI RM3100 magnetometer.
 
-Dave Witten's RM3100 data collection code can be found here:
+It was made to help compare possible magnetometer installation locations by looking at the noise present in recordings from each position. The program works with `.log` files produced using Dave Witten's `rm3100-runMag` software.
+
+The calculator does not communicate with the RM3100 or collect data itself. The recordings should already be completed and copied from the Raspberry Pi before using this program.
+
+## References
+
+RM3100 data collection software:
 
 https://github.com/wittend/rm3100-runMag
 
-HamSCI RM3100 setup and installation documentation can be found here:
+HamSCI RM3100 documentation:
 
 https://hamsci.org/mag_software
 
 https://hamsci.org/mag_install
 
-This tool does not collect data from the RM3100 directly. It only processes existing `.log` files after they have been copied from the Raspberry Pi.
+## Requirements
 
----
+Python 3 is required along with NumPy, Matplotlib, and SciPy.
 
-## What It Does
-
-`ProcessTest.py` lets the user select RM3100 log files, organize them by site/test name, split the data into time segments, and generate noise-floor plots.
-
-The script automatically:
-
-* merges selected raw log files,
-* sorts the data chronologically,
-* saves a full merged archive,
-* splits the data into fixed-length segments,
-* calculates Welch PSD/ASD curves for X, Y, Z, and total field,
-* estimates the broadband noise floor from 0.10 Hz to 0.40 Hz,
-* saves PSD overlay plots,
-* saves noise-floor plots,
-* saves a CSV summary of the noise-floor results.
-
----
-
-## Installation
-
-Install Python 3, then install the required packages:
+Install the required Python packages with:
 
 ```bash
 pip install numpy matplotlib scipy
 ```
 
-On Linux or Raspberry Pi OS, install tkinter if needed:
+The program uses Tkinter for the interface. Tkinter is normally included with Python on Windows.
+
+On Linux or Raspberry Pi OS, it may need to be installed separately:
 
 ```bash
 sudo apt install python3-tk
 ```
 
----
+## Running the Program
 
-## How to Run
+Download or clone this repository, then open a terminal in the repository folder.
 
-From the repository folder, run:
+Run:
 
 ```bash
 python ProcessTest.py
 ```
 
-or on some systems:
+Depending on the system, Python may instead be called with:
 
 ```bash
 python3 ProcessTest.py
 ```
 
-A small window will open.
+A small window will open with four inputs:
 
-Select:
+1. **Raw log file(s)**
+   Select one or more RM3100 `.log` files from the same test.
 
-1. the raw RM3100 log file or files,
-2. a site folder name,
-3. a test label,
-4. the segment length in minutes.
+2. **Site folder**
+   Choose an existing site folder or enter a new name. Tests from the same general installation site can be kept together here.
 
-For this method, a 5-minute segment length is recommended.
+3. **Test label**
+   Give the individual test a useful name such as `Backyard_Close`, `Fence_Test`, or `Location_3`.
 
----
+4. **Segment length**
+   This controls how the recording is divided before analysis. Five-minute segments are recommended for the current testing method.
+
+Press **Run** once the information is filled in.
+
+## What the Program Does
+
+The selected log files are first combined and sorted by timestamp. A complete merged copy is saved before the recording is divided into smaller time segments.
+
+Each segment is then analyzed using Welch's method to calculate the amplitude spectral density for:
+
+* X
+* Y
+* Z
+* Total magnetic field
+
+The current program assumes the RM3100 data was recorded at approximately 1 Hz.
+
+A broadband noise-floor estimate is calculated between **0.10 Hz and 0.40 Hz**. The program also uses **10 nT/√Hz** as a reference value when reporting the results.
+
+The reference is useful for quickly comparing tests, but the plots should still be reviewed when choosing a location.
 
 ## Output
 
-The script saves results inside the repository folder unless the user chooses another location.
+Results are saved inside the selected site folder.
 
-Example output:
+For a test labeled `Backyard_Far`, the folder will look similar to:
 
 ```text
 SiteName/
 ├── All/
-│   └── TestLabel_full.log
-├── TestLabel/
+│   └── Backyard_Far_full.log
+│
+├── Backyard_Far/
 │   ├── 2026-05-28_22-00-00.log
 │   ├── 2026-05-28_22-05-00.log
 │   └── ...
-├── TestLabel Figures/
-│   ├── X_TestLabel.png
-│   ├── X_TestLabel_noisefloor.png
-│   ├── Y_TestLabel.png
-│   ├── Y_TestLabel_noisefloor.png
-│   ├── Z_TestLabel.png
-│   ├── Z_TestLabel_noisefloor.png
-│   ├── TOTAL_TestLabel.png
-│   └── TOTAL_TestLabel_noisefloor.png
-└── TestLabel_noise_summary.csv
+│
+├── Backyard_Far Figures/
+│   ├── X_Backyard_Far.png
+│   ├── X_Backyard_Far_noisefloor.png
+│   ├── Y_Backyard_Far.png
+│   ├── Y_Backyard_Far_noisefloor.png
+│   ├── Z_Backyard_Far.png
+│   ├── Z_Backyard_Far_noisefloor.png
+│   ├── TOTAL_Backyard_Far.png
+│   └── TOTAL_Backyard_Far_noisefloor.png
+│
+└── Backyard_Far_noise_summary.csv
 ```
 
----
+### `All`
 
-## Basic Workflow
+Contains the complete merged recording before it is divided into segments.
 
-1. Place the RM3100 at a test location.
-2. Record data using the Raspberry Pi and `rm3100-runMag`.
-3. Copy the `.log` file from the Raspberry Pi.
-4. Run `ProcessTest.py`.
-5. Review the plots and CSV noise-floor results.
-6. Move the RM3100 to another location and repeat.
-7. Compare results and choose the best location.
+### Test Folder
 
-For reliable comparison, about 30 minutes of data per location is recommended.
+Contains the individual time segments used for the analysis.
 
----
+### Figures
 
-## Input File Format
+Two figures are produced for each magnetic-field channel.
 
-The script expects RM3100 log files with columns like:
+The regular PSD plot shows the individual time segments together. This makes it easier to spot changes in noise during the recording.
+
+The noise-floor plot shows the median spectrum, the spread between segments, the calculated noise floor, and the current reference line.
+
+### Noise Summary
+
+The CSV file contains the calculated noise floor for X, Y, Z, and total field along with the frequency range, reference value, pass/fail result, and number of segments used.
+
+## Testing a Location
+
+For site testing, collect roughly **30 minutes of data at each candidate position**.
+
+Try to keep the recording length, magnetometer settings, and analysis settings the same between locations.
+
+A basic testing cycle is:
+
+1. Choose a possible magnetometer location.
+2. Record approximately 30 minutes of data.
+3. Copy the resulting `.log` file to the computer.
+4. Process the recording with `ProcessTest.py`.
+5. Repeat the test at another position.
+6. Compare the noise-floor values and plots.
+
+The best position should not be chosen from the pass/fail result alone.
+
+When comparing locations, look for lower noise-floor values, consistent results between segments, and fewer large or repeating peaks in the PSD plots.
+
+After finding the quietest general area, additional measurements can be taken a short distance apart to narrow down the final installation position.
+
+## Expected Log Format
+
+The program expects RM3100 logs containing these columns:
 
 ```text
 "time", "rtemp", "ltemp", "x", "y", "z", "rx", "ry", "rz", "total"
 ```
 
-The timestamp can be either human-readable UTC time or epoch time. The script converts human-readable timestamps automatically.
+Timestamps may be stored as UTC date/time strings or epoch time. Human-readable timestamps are converted automatically during processing.
 
----
+Multiple log files from the same test can be selected together. The program sorts their measurements by timestamp before creating the merged file.
 
 ## Credits
 
-RM3100 data collection is based on Dave Witten's `rm3100-runMag` repository and HamSCI PSWS RM3100 setup documentation.
+RM3100 data collection is based on Dave Witten's `rm3100-runMag` project and the HamSCI Personal Space Weather Station RM3100 documentation.
 
-This tool is only for post-processing recorded RM3100 log files.
+This repository is intended for post-processing and site comparison of previously recorded RM3100 data.
